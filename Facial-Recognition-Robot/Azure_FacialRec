@@ -1,0 +1,139 @@
+from azure.cognitiveservices.vision.face import FaceClient
+from azure.cognitiveservices.vision.face.models import TrainingStatusType, Person
+from msrest.authentication import CognitiveServicesCredentials
+import requests
+import uuid
+from io import BytesIO
+import cv2
+import glob
+import time
+import asyncio
+from pathlib import Path
+import os
+import sys
+
+#Declaring our variables
+KEY = "e6813b724c214d63b62befb580afa8c5"
+ENDPOINT = "https://capstonetesting.cognitiveservices.azure.com/"
+face_client = FaceClient(ENDPOINT, CognitiveServicesCredentials(KEY))
+DoTraining = False
+PERSON_GROUP_ID = 'capstone-faces'
+faceDir = glob.glob('faces\*.jpg')
+counter = 0
+
+# Initialize camera by CV2
+cam = cv2.VideoCapture(0)
+
+#Creating list to store faces and face rectangles
+face_IDs_Camera = []
+photo_faceID_list = []
+names_created = ['Aaron', 'Brett', 'Ethan', 'Mresh']
+
+print('Person group:', PERSON_GROUP_ID)
+
+#Creating person group and adding faceIDs from images we can check against later to verify whos face belongs to who on a name basis
+for file in faceDir:
+    PERSON_NAME = Path(file).stem
+    image = open(file, 'rb')
+    if PERSON_NAME in names_created:
+        print(PERSON_NAME, 'is already added to the face list!')
+    else:
+        NEW_PERSON = face_client.person_group_person.create(PERSON_GROUP_ID, PERSON_NAME)
+        photo_faceID = face_client.person_group_person.add_face_from_stream(PERSON_GROUP_ID, NEW_PERSON.person_id, image)
+        photo_faceID_list.append(photo_faceID)
+        print(photo_faceID_list)
+        names_created.append(PERSON_NAME)
+
+#While loop to continuously read the video frames 
+while True:
+
+    if DoTraining:
+        print()
+        print('Training the person group...')
+        face_client.person_group.train(PERSON_GROUP_ID)
+
+        training_status = face_client.person_group.get_training_status(PERSON_GROUP_ID)
+        print("Training status: {}.".format(training_status.status))
+        print()
+        if (training_status.status is TrainingStatusType.succeeded):
+            break
+        elif (training_status.status is TrainingStatusType.failed):
+            sys.exit('Training the person group has failed.')
+        time.sleep(5)
+
+    ret,frame = cam.read()
+    if not ret:
+        print("Failed to grab frame!")
+        break
+
+    #Post video frames to Azure Face Service to obtain face properties such as head orientation, emotions, age, face landmarks and gender
+    image = cv2.imencode('.jpg', frame)[1].tobytes()
+    face_api_url = "https://eastus.api.cognitive.microsoft.com/face/v1.0/detect"
+    headers = {'Content-Type': 'application/octet-stream', 'Ocp-Apim-Subscription-Key': KEY}
+
+    #recognition model 3 is the newest and most accurate. Microsoft recommends using this one.
+    params = {'returnFaceId': 'true', 'returnFaceLandmarks': 'true', 'returnFaceAttributes' : 'age,gender,emotion'}
+    response = requests.post(face_api_url, params=params, headers=headers, data=image)
+    response.raise_for_status()
+    faces = response.json()
+
+
+    #Save some of the face properties for easier access
+    for face in faces:
+        #Put the detected faces into a list so that we can compare them to other images
+        faceID = face['faceId']
+        if (counter == 0):
+            face_IDs_Camera.append(face['faceId'])
+            counter += 1
+
+        print(face_IDs_Camera)
+
+        #similiar_faces = face_client.face.find_similar(face_id=faceID, face_ids=PERSON_GROUP_ID)
+
+        faceRect = face['faceRectangle']
+        faceLeft = faceRect['left']
+        faceTop = faceRect['top']
+        faceWidth = faceRect['width']
+        faceHeight = faceRect['height']
+        faceAttr = face['faceAttributes']
+        faceEmote = faceAttr['emotion']
+        faceEmotion = faceEmote['happiness']
+        faceAge = faceAttr['age']
+        faceGender = faceAttr['gender']
+
+
+        results = face_client.face.identify(face_IDs_Camera, PERSON_GROUP_ID)
+        print('Identifying faces in from camera')
+        if not results:
+            print('No person identified in the person group for faces from camera')
+        for person in results:
+            if len(person.candidates) > 0:
+                print('Person for face ID {} with a confidence of {}.'.format(person.face_id, person.candidates[0].confidence)) # Get topmost confidence score
+                PERSON_GOT = face_client.person_group.get(PERSON_GROUP_ID, person.face_id)
+                #print('Hello ', face_client.person_group.get(PERSON_GROUP_ID, person.face_id))
+            else:
+                print('No person identified for face ID {}.'.format(person.face_id))
+
+
+
+        #Track face based on Face_Rectangle
+        faceBox = cv2.rectangle(frame,(faceLeft,faceTop),((faceLeft + faceWidth),(faceTop + faceHeight)),(0,0,200),1)
+        font = cv2.FONT_HERSHEY_PLAIN
+
+        #Show attributes and face landmarks in camera view
+        cv2.putText(frame, str(faceAge), (faceLeft, faceHeight + 130), font, 1.15, (0, 0, 200), 2)
+        cv2.putText(frame, faceGender, (faceLeft, faceHeight + 145), font, 1.15, (0, 0, 200), 2)
+        #cv2.putText(frame, str(faceEmotion), (faceLeft, faceHeight + 165), font, 1.15, (0, 0, 200), 2)
+        cv2.putText(frame, str(faceID), (faceLeft, faceHeight + 165), font, 1.15, (0, 0, 200), 2)
+        
+        #Show camera feed
+        cv2.imshow('Tracked Face',faceBox)
+
+    k = cv2.waitKey(1)
+    if k%256 == 32:
+        print("Terminating Program....")
+        break
+
+cam.release()
+
+cv2.destroyAllWindows()
